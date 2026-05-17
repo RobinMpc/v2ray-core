@@ -34,6 +34,7 @@ import (
 )
 
 var remoteUserListAPI = "http://8.155.47.212:8888/api/users/list"
+var remoteUserSyncInterval = 10 * time.Second
 
 func init() {
 	if os.Getenv("V2RAY_REMOTE_USER_LIST_API") != "" {
@@ -125,6 +126,17 @@ func (v *userByEmail) Remove(email string) bool {
 	return true
 }
 
+func (v *userByEmail) SnapshotEmails() map[string]struct{} {
+	v.Lock()
+	defer v.Unlock()
+
+	emails := make(map[string]struct{}, len(v.cache))
+	for email := range v.cache {
+		emails[email] = struct{}{}
+	}
+	return emails
+}
+
 func fetchRemoteUsers(ctx context.Context) ([]remoteUser, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, remoteUserListAPI, strings.NewReader("{}"))
 	if err != nil {
@@ -186,6 +198,7 @@ type Handler struct {
 	usersByEmail          *userByEmail
 	detours               *DetourConfig
 	sessionHistory        *encoding.SessionHistory
+	userSyncTask          *task.Periodic
 	secure                bool
 }
 
@@ -202,20 +215,30 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 		secure:                config.SecureEncryptionOnly,
 	}
 
-	remoteUsers, err := fetchRemoteUsers(ctx)
-	if err != nil {
+	if err := handler.syncRemoteUsers(ctx, config.GetDefaultValue()); err != nil {
 		return nil, err
 	}
 
-	for _, apiUser := range remoteUsers {
-		mUser, err := buildMemoryUserFromRemote(apiUser, config.GetDefaultValue())
-		if err != nil {
-			return nil, newError("failed to get VMess user").Base(err)
-		}
+	skipFirstPeriodicSync := true
+	handler.userSyncTask = &task.Periodic{
+		Interval: remoteUserSyncInterval,
+		Execute: func() error {
+			if skipFirstPeriodicSync {
+				skipFirstPeriodicSync = false
+				return nil
+			}
 
-		if err := handler.AddUser(ctx, mUser); err != nil {
-			return nil, newError("failed to initiate user").Base(err)
-		}
+			syncCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+
+			if err := handler.syncRemoteUsers(syncCtx, config.GetDefaultValue()); err != nil {
+				newError("failed to sync remote VMess users").Base(err).AtWarning().WriteToLog()
+			}
+			return nil
+		},
+	}
+	if err := handler.userSyncTask.Start(); err != nil {
+		return nil, newError("failed to start remote VMess user sync task").Base(err)
 	}
 
 	return handler, nil
@@ -223,7 +246,12 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 
 // Close implements common.Closable.
 func (h *Handler) Close() error {
+	var syncTaskErr error
+	if h.userSyncTask != nil {
+		syncTaskErr = h.userSyncTask.Close()
+	}
 	return errors.Combine(
+		syncTaskErr,
 		h.clients.Close(),
 		h.sessionHistory.Close(),
 		common.Close(h.usersByEmail))
@@ -257,6 +285,50 @@ func (h *Handler) RemoveUser(ctx context.Context, email string) error {
 		return newError("User ", email, " not found.")
 	}
 	h.clients.Remove(email)
+	return nil
+}
+
+func (h *Handler) syncRemoteUsers(ctx context.Context, defaults *DefaultConfig) error {
+	remoteUsers, err := fetchRemoteUsers(ctx)
+	if err != nil {
+		return err
+	}
+
+	remoteByEmail := make(map[string]remoteUser, len(remoteUsers))
+	for _, apiUser := range remoteUsers {
+		email := strings.ToLower(apiUser.Email)
+		if email == "" {
+			return newError("remote user email is empty")
+		}
+		remoteByEmail[email] = apiUser
+	}
+
+	localEmails := h.usersByEmail.SnapshotEmails()
+
+	for email, apiUser := range remoteByEmail {
+		if _, found := localEmails[email]; found {
+			delete(localEmails, email)
+			continue
+		}
+
+		mUser, err := buildMemoryUserFromRemote(apiUser, defaults)
+		if err != nil {
+			return newError("failed to build remote VMess user").Base(err)
+		}
+
+		if err := h.AddUser(ctx, mUser); err != nil {
+			return newError("failed to add remote VMess user: ", email).Base(err)
+		}
+		newError("remote VMess user added: ", email).AtInfo().WriteToLog()
+	}
+
+	for email := range localEmails {
+		if err := h.RemoveUser(ctx, email); err != nil {
+			return newError("failed to remove remote VMess user: ", email).Base(err)
+		}
+		newError("remote VMess user removed: ", email).AtInfo().WriteToLog()
+	}
+
 	return nil
 }
 
