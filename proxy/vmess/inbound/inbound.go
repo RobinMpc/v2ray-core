@@ -4,7 +4,10 @@ package inbound
 
 import (
 	"context"
+	"encoding/json"
 	"io"
+	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +32,28 @@ import (
 	"github.com/v2fly/v2ray-core/v5/proxy/vmess/encoding"
 	"github.com/v2fly/v2ray-core/v5/transport/internet"
 )
+
+var remoteUserListAPI = "http://8.155.47.212:8888/api/users/list"
+
+func init() {
+	if os.Getenv("V2RAY_REMOTE_USER_LIST_API") != "" {
+		remoteUserListAPI = os.Getenv("V2RAY_REMOTE_USER_LIST_API")
+	}
+}
+
+type remoteUser struct {
+	UserID string `json:"user_id"`
+	UUID   string `json:"uuid"`
+	Email  string `json:"email"`
+}
+
+type remoteUserListResponse struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Data    struct {
+		Users []remoteUser `json:"users"`
+	} `json:"data"`
+}
 
 type userByEmail struct {
 	sync.Mutex
@@ -100,6 +125,59 @@ func (v *userByEmail) Remove(email string) bool {
 	return true
 }
 
+func fetchRemoteUsers(ctx context.Context) ([]remoteUser, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, remoteUserListAPI, strings.NewReader("{}"))
+	if err != nil {
+		return nil, newError("failed to create user list request").Base(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, newError("failed to fetch VMess users from API").Base(err)
+	}
+	defer common.Close(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, newError("user list API returned unexpected status: ", resp.StatusCode, ", body: ", string(body))
+	}
+
+	var apiResp remoteUserListResponse
+	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+		return nil, newError("failed to decode user list API response").Base(err)
+	}
+	if apiResp.Code != 0 {
+		return nil, newError("user list API returned error: ", apiResp.Code, ", message: ", apiResp.Message)
+	}
+	return apiResp.Data.Users, nil
+}
+
+func buildMemoryUserFromRemote(apiUser remoteUser, defaults *DefaultConfig) (*protocol.MemoryUser, error) {
+	email := apiUser.Email
+	if email == "" {
+		email = apiUser.UserID
+	}
+
+	account, err := (&vmess.Account{
+		Id:      apiUser.UUID,
+		AlterId: defaults.GetAlterId(),
+		SecuritySettings: &protocol.SecurityConfig{
+			Type: protocol.SecurityType_AUTO,
+		},
+	}).AsAccount()
+	if err != nil {
+		return nil, newError("failed to build VMess account for remote user: ", email).Base(err)
+	}
+
+	return &protocol.MemoryUser{
+		Account: account,
+		Email:   email,
+		Level:   defaults.GetLevel(),
+	}, nil
+}
+
 // Handler is an inbound connection handler that handles messages in VMess protocol.
 type Handler struct {
 	policyManager         policy.Manager
@@ -124,8 +202,13 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 		secure:                config.SecureEncryptionOnly,
 	}
 
-	for _, user := range config.User {
-		mUser, err := user.ToMemoryUser()
+	remoteUsers, err := fetchRemoteUsers(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, apiUser := range remoteUsers {
+		mUser, err := buildMemoryUserFromRemote(apiUser, config.GetDefaultValue())
 		if err != nil {
 			return nil, newError("failed to get VMess user").Base(err)
 		}
