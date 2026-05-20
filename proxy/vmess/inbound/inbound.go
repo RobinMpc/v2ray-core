@@ -13,6 +13,7 @@ import (
 	"time"
 
 	core "github.com/v2fly/v2ray-core/v5"
+	"github.com/v2fly/v2ray-core/v5/app/trafficmonitor"
 	"github.com/v2fly/v2ray-core/v5/common"
 	"github.com/v2fly/v2ray-core/v5/common/buf"
 	"github.com/v2fly/v2ray-core/v5/common/errors"
@@ -449,7 +450,13 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection i
 		if err != nil {
 			return newError("failed to start decoding").Base(err)
 		}
-		if err := buf.Copy(bodyReader, link.Writer, buf.UpdateActivity(timer)); err != nil {
+
+		var writer buf.Writer = link.Writer
+		if m := trafficmonitor.GetMonitor(); m != nil {
+			writer = trafficmonitor.NewCountingWriter(link.Writer, m, request.User.Email, true)
+		}
+
+		if err := buf.Copy(bodyReader, writer, buf.UpdateActivity(timer)); err != nil {
 			return newError("failed to transfer request").Base(err)
 		}
 		return nil
@@ -464,7 +471,13 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection i
 		response := &protocol.ResponseHeader{
 			Command: h.generateCommand(ctx, request),
 		}
-		return transferResponse(timer, svrSession, request, response, link.Reader, writer)
+
+		var downReader buf.Reader = link.Reader
+		if m := trafficmonitor.GetMonitor(); m != nil {
+			downReader = trafficmonitor.NewCountingReader(link.Reader, m, request.User.Email, false)
+		}
+
+		return transferResponse(timer, svrSession, request, response, downReader, writer)
 	}
 
 	requestDonePost := task.OnSuccess(requestDone, task.Close(link.Writer))

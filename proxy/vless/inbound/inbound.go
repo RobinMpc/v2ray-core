@@ -9,6 +9,7 @@ import (
 	"time"
 
 	core "github.com/v2fly/v2ray-core/v5"
+	"github.com/v2fly/v2ray-core/v5/app/trafficmonitor"
 	"github.com/v2fly/v2ray-core/v5/common"
 	"github.com/v2fly/v2ray-core/v5/common/buf"
 	"github.com/v2fly/v2ray-core/v5/common/errors"
@@ -400,8 +401,13 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection i
 		// default: clientReader := reader
 		clientReader := encoding.DecodeBodyAddons(reader, request, requestAddons)
 
+		var upWriter buf.Writer = serverWriter
+		if m := trafficmonitor.GetMonitor(); m != nil {
+			upWriter = trafficmonitor.NewCountingWriter(serverWriter, m, request.User.Email, true)
+		}
+
 		// from clientReader.ReadMultiBuffer to serverWriter.WriteMultiBuffer
-		if err := buf.Copy(clientReader, serverWriter, buf.UpdateActivity(timer)); err != nil {
+		if err := buf.Copy(clientReader, upWriter, buf.UpdateActivity(timer)); err != nil {
 			return newError("failed to transfer request payload").Base(err).AtInfo()
 		}
 
@@ -433,8 +439,13 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection i
 			return newError("failed to write A response payload").Base(err).AtWarning()
 		}
 
+		var downReader buf.Reader = serverReader
+		if m := trafficmonitor.GetMonitor(); m != nil {
+			downReader = trafficmonitor.NewCountingReader(serverReader, m, request.User.Email, false)
+		}
+
 		// from serverReader.ReadMultiBuffer to clientWriter.WriteMultiBuffer
-		if err := buf.Copy(serverReader, clientWriter, buf.UpdateActivity(timer)); err != nil {
+		if err := buf.Copy(downReader, clientWriter, buf.UpdateActivity(timer)); err != nil {
 			return newError("failed to transfer response payload").Base(err).AtInfo()
 		}
 
